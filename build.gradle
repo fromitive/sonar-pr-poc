@@ -1,0 +1,25 @@
+plugins {
+    id 'java'
+    // SonarScanner for Gradle. 최신 버전은 Gradle Plugin Portal(org.sonarqube)에서 확인 후 고정
+    id 'org.sonarqube' version '6.0.1.5171'
+}
+
+group = 'com.example'
+version = '0.0.1'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+sonar {
+    properties {
+        // projectKey / host / token 은 워크플로에서 -D 와 환경변수로 주입한다 (여기에 하드코딩하지 않음)
+        property 'sonar.sourceEncoding', 'UTF-8'
+    }
+}

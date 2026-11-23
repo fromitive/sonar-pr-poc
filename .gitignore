@@ -1,0 +1,6 @@
+.gradle/
+build/
+.scannerwork/
+sast-result.md
+.idea/
+*.iml
