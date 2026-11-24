@@ -55,16 +55,23 @@ jobs:
           # Use the add_project/select APIs from the separate Quality Profile guide.
 
       - name: Gradle build
+        run: ./gradlew --no-daemon clean build --build-cache
+
+      - name: Generate Gradle dependency lockfile
         shell: bash
         run: |
           set -euo pipefail
 
-          test -s gradle.lockfile
-          git ls-files --error-unmatch gradle.lockfile
+          ./gradlew --no-daemon \
+            -I .sonar-pr/dependency-lock.init.gradle \
+            dependencies --write-locks
 
-          ./gradlew --no-daemon clean build --build-cache
+          if [ ! -s gradle.lockfile ]; then
+            echo "::error::Failed to generate gradle.lockfile"
+            exit 1
+          fi
 
-          git diff --exit-code HEAD -- gradle.lockfile
+          cat gradle.lockfile
 
       - name: Trivy Gradle dependency scan
         shell: bash
