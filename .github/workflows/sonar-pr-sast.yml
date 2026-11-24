@@ -32,6 +32,19 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Check Java and Gradle version
+        shell: bash
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+          ./gradlew --version
+
       - name: Ensure SonarQube PR project
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
