@@ -67,57 +67,54 @@ jobs:
           # Optional: apply Quality Profile and Quality Gate here, BEFORE analysis.
           # Use the add_project/select APIs from the separate Quality Profile guide.
 
-      - name: Gradle build
+      - name: Initialize Gradle environment
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "[INFO] Java environment"
-          echo "JAVA_HOME=$JAVA_HOME"
-          which java
-          java -version
-
-          echo "[INFO] Stop Gradle daemon"
-          ./gradlew --stop
-
-          echo "[INFO] Isolate Gradle caches"
           export GRADLE_USER_HOME="$(mktemp -d "${RUNNER_TEMP}/gradle.XXXXXX")"
+
+          echo "GRADLE_USER_HOME=$GRADLE_USER_HOME" >> "$GITHUB_ENV"
 
           rm -rf .gradle build
 
-          echo "[INFO] Check Gradle version"
+          java -version
           ./gradlew --version
-
-          echo "[INFO] Validate Gradle configuration"
-          ./gradlew \
-            -Dorg.gradle.java.home="$JAVA_HOME" \
-            --no-daemon \
-            --no-configuration-cache \
-            help --stacktrace
-
-          echo "[INFO] Gradle build"
-          ./gradlew \
-            -Dorg.gradle.java.home="$JAVA_HOME" \
-            --no-daemon \
-            --no-build-cache \
-            --no-configuration-cache \
-            clean build --stacktrace --info
 
       - name: Generate Gradle dependency lockfile
         shell: bash
         run: |
           set -euo pipefail
 
-          ./gradlew --no-daemon \
+          ./gradlew \
+            -Dorg.gradle.java.home="$JAVA_HOME" \
+            --no-daemon \
             -I .sonar-pr/dependency-lock.init.gradle \
             dependencies --write-locks
 
-          if [ ! -s gradle.lockfile ]; then
-            echo "::error::Failed to generate gradle.lockfile"
-            exit 1
-          fi
-
+          test -s gradle.lockfile
           cat gradle.lockfile
+
+      - name: Gradle build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ./gradlew \
+            -Dorg.gradle.java.home="$JAVA_HOME" \
+            --no-daemon \
+            -I .sonar-pr/dependency-lock.init.gradle \
+            clean build --build-cache
+
+      - name: Trivy Gradle dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bash .sonar-pr/trivy-scan.sh
+
+          test -s .trivy-poc/trivy.json
+          test -s .trivy-poc/sonar.json
 
       - name: Trivy Gradle dependency scan
         shell: bash
