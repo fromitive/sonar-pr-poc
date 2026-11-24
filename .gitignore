@@ -4,3 +4,4 @@ build/
 sast-result.md
 .idea/
 *.iml
+actions-runner/

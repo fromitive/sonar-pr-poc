@@ -1,0 +1,136 @@
+name: sonar-pr-sast
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+# 같은 PR에 새 Push가 오면 이전 실행은 취소 (PR끼리는 서로 독립)
+concurrency:
+  group: sonar-pr-sast-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+  SONAR_PROJECT_KEY: pr-${{ github.event.repository.name }}-${{ github.event.pull_request.number }}
+  JACKSON_VERSION: 2.17.2
+
+jobs:
+  sast:
+    # ⚠️ 이 job 이름이 브랜치 보호의 Required check 이름이 된다
+    name: sonar-pr-sast
+    if: github.event.action != 'closed'
+    runs-on: [self-hosted, sonar-poc]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write   # PR 요약 코멘트용
+    steps:
+      # PR 머지 커밋이 아니라 PR HEAD 자체를 체크아웃
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Compute merge-base
+        id: mb
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          MB=$(git merge-base "origin/${BASE_REF}" HEAD)
+          echo "merge_base=${MB}" >> "$GITHUB_OUTPUT"
+          echo "base=${BASE_REF} merge-base=${MB}"
+          git diff --stat "${MB}" HEAD
+
+      - name: Ensure SonarQube PR project
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            "${SONAR_HOST_URL}/api/components/show?component=${SONAR_PROJECT_KEY}")
+          if [ "$code" = "404" ]; then
+            curl -fsS -H "Authorization: Bearer ${SONAR_TOKEN}" -X POST "${SONAR_HOST_URL}/api/projects/create" \
+              --data-urlencode "project=${SONAR_PROJECT_KEY}" \
+              --data-urlencode "name=PR ${REPO_NAME} #${PR_NUMBER}"
+            echo "created ${SONAR_PROJECT_KEY}"
+          elif [ "$code" = "200" ]; then
+            echo "reuse ${SONAR_PROJECT_KEY}"
+          else
+            echo "::error title=SonarQube 접근 실패::HTTP ${code} (토큰/URL/서버 상태 확인)"
+            exit 1
+          fi
+
+      - name: Build & SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}   # Scanner가 환경변수로 읽음 (명령행에 노출하지 않음)
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          rm -f build/sonar/report-task.txt
+          ./gradlew --no-daemon clean build sonar \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+            -Dsonar.projectVersion="${HEAD_SHA}" \
+            -Dsonar.qualitygate.wait=false
+
+      - name: Prepare gate dependencies (Jackson)
+        run: |
+          set -euo pipefail
+          LIB="${RUNNER_TOOL_CACHE}/pr-sast-gate/${JACKSON_VERSION}"
+          mkdir -p "$LIB"
+          for a in jackson-databind jackson-core jackson-annotations; do
+            f="$LIB/$a-${JACKSON_VERSION}.jar"
+            [ -s "$f" ] || curl -fsSL -o "$f" \
+              "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/$a/${JACKSON_VERSION}/$a-${JACKSON_VERSION}.jar"
+          done
+          echo "GATE_LIB=$LIB" >> "$GITHUB_ENV"
+
+      - name: Security gate
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          MERGE_BASE: ${{ steps.mb.outputs.merge_base }}
+          BLOCK_SEVERITIES: ${{ vars.BLOCK_SEVERITIES || 'BLOCKER,HIGH' }}
+          REPORT_TASK_FILE: build/sonar/report-task.txt
+          CE_TIMEOUT_MINUTES: "10"
+        run: java -cp "${GATE_LIB}/*" .sonar-pr/PrSastGate.java
+
+      # 성공/실패와 관계없이 PR에 요약 코멘트 1개를 생성 또는 갱신
+      - name: PR summary comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- sonar-pr-sast -->';
+            let body = fs.existsSync('sast-result.md')
+              ? fs.readFileSync('sast-result.md', 'utf8')
+              : '## ❌ SAST 스캔 실패\n\n빌드 또는 분석 단계에서 실패했습니다. **병합할 수 없습니다.** Actions 로그를 확인하세요.';
+            body = `${marker}\n${body}\n\n_run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}_`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const mine = comments.find(c => c.body && c.body.startsWith(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  cleanup:
+    name: sonar-pr-cleanup
+    if: github.event.action == 'closed'
+    runs-on: [self-hosted, sonar-poc]
+    steps:
+      - name: Delete SonarQube PR project
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          curl -fsS -H "Authorization: Bearer ${SONAR_TOKEN}" -X POST "${SONAR_HOST_URL}/api/projects/delete" \
+            --data-urlencode "project=${SONAR_PROJECT_KEY}" \
+            && echo "deleted ${SONAR_PROJECT_KEY}" \
+            || echo "::warning::프로젝트 삭제 실패(이미 없거나 서버 오류): ${SONAR_PROJECT_KEY}"
