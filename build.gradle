@@ -17,6 +17,14 @@ repositories {
     mavenCentral()
 }
 
+dependencyLocking {
+    lockAllConfigurations()
+    lockMode = LockMode.STRICT
+}
+dependencies {
+    implementation 'org.apache.logging.log4j:log4j-core:2.17.1'
+}
+
 sonar {
     properties {
         // projectKey / host / token 은 워크플로에서 -D 와 환경변수로 주입한다 (여기에 하드코딩하지 않음)
