@@ -4,7 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
 
-# 같은 PR에 새 Push가 오면 이전 실행은 취소 (PR끼리는 서로 독립)
+# 같은 PR의 이전 실행을 취소한다. PR 간 전역 용량 제어는 이 설정이 아닌 runner 풀로 처리한다.
 concurrency:
   group: sonar-pr-sast-${{ github.repository }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -12,107 +12,164 @@ concurrency:
 env:
   SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
   SONAR_PROJECT_KEY: pr-${{ github.event.repository.name }}-${{ github.event.pull_request.number }}
-  SONAR_PROJECT_NAME: ${{ github.event.repository.name }}-${{ github.event.pull_request.number }}
-  JACKSON_VERSION: 2.17.2
+  SONAR_PROJECT_NAME: ${{ github.event.repository.name }} [PR #${{ github.event.pull_request.number }}]
+  JACKSON_VERSION: '2.17.2'
 
 jobs:
-  sast:
-    # ⚠️ 이 job 이름이 브랜치 보호의 Required check 이름이 된다
-    name: sonar-pr-sast
+  # 별도 단일 runner를 이용해 조직 전체 SonarQube 제출 속도를 제한한다.
+  # 모든 참여 저장소에 동일한 전용 runner를 허용해야 한다.
+  scan:
+    name: sonar-scan-submit
     if: github.event.action != 'closed'
-    runs-on: [self-hosted, sonar-poc]
+    runs-on: [self-hosted, sonar-scan]
     timeout-minutes: 30
     permissions:
       contents: read
-      pull-requests: write   # PR 요약 코멘트용
     steps:
-      # PR 머지 커밋이 아니라 PR HEAD 자체를 체크아웃
-      - name: Checkout PR head
+      - name: Checkout feature HEAD
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
-      - name: Compute merge-base
-        id: mb
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-          MB=$(git merge-base "origin/${BASE_REF}" HEAD)
-          echo "merge_base=${MB}" >> "$GITHUB_OUTPUT"
-          echo "base=${BASE_REF} merge-base=${MB}"
-          git diff --stat "${MB}" HEAD
-
       - name: Ensure SonarQube PR project
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO_NAME: ${{ github.event.repository.name }}
+        shell: bash
         run: |
           set -euo pipefail
-          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${SONAR_TOKEN}" \
-            "${SONAR_HOST_URL}/api/components/show?component=${SONAR_PROJECT_KEY}")
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            --get --data-urlencode "component=${SONAR_PROJECT_KEY}" \
+            "${SONAR_HOST_URL}/api/components/show")
           if [ "$code" = "404" ]; then
-            curl -fsS -H "Authorization: Bearer ${SONAR_TOKEN}" -X POST "${SONAR_HOST_URL}/api/projects/create" \
+            curl -fsS -X POST -H "Authorization: Bearer ${SONAR_TOKEN}" \
+              "${SONAR_HOST_URL}/api/projects/create" \
               --data-urlencode "project=${SONAR_PROJECT_KEY}" \
-              --data-urlencode "name=PR ${REPO_NAME} #${PR_NUMBER}"
-            echo "created ${SONAR_PROJECT_KEY}"
-          elif [ "$code" = "200" ]; then
-            echo "reuse ${SONAR_PROJECT_KEY}"
-          else
-            echo "::error title=SonarQube 접근 실패::HTTP ${code} (토큰/URL/서버 상태 확인)"
+              --data-urlencode "name=${SONAR_PROJECT_NAME}"
+          elif [ "$code" != "200" ]; then
+            echo "Unexpected SonarQube HTTP $code" >&2
             exit 1
           fi
+          # Optional: apply Quality Profile and Quality Gate here, BEFORE analysis.
+          # Use the add_project/select APIs from the separate Quality Profile guide.
 
-      - name: Build & SonarQube analysis
+      - name: Gradle build
+        run: ./gradlew --no-daemon clean build --build-cache
+
+      - name: Limit SonarQube CE backlog before submission
         env:
-            SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-            HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          CE_MAX_PENDING: '0'
+          CE_ADMISSION_TIMEOUT_SECONDS: '900'
+          CE_ADMISSION_POLL_SECONDS: '10'
+        shell: bash
+        run: python3 .sonar-pr/ce-admission.py
+
+      - name: Submit SonarScanner analysis (no QG wait)
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
         run: |
           set -euo pipefail
           rm -f build/sonar/report-task.txt
-          ./gradlew --no-daemon clean build sonar \
+          ./gradlew --no-daemon sonar \
             -Dsonar.host.url="${SONAR_HOST_URL}" \
             -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
             -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
             -Dsonar.projectVersion="${HEAD_SHA}" \
             -Dsonar.qualitygate.wait=false
+          test -s build/sonar/report-task.txt
+          grep -q '^ceTaskId=' build/sonar/report-task.txt
 
-      - name: Prepare gate dependencies (Jackson)
+      - name: Transfer CE task identity to gate job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ce-task-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/sonar/report-task.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  # GitHub Branch Protection: require ONLY this job as sonar-pr-sast.
+  # If scan fails, this job also fails, instead of being silently skipped.
+  gate:
+    name: sonar-pr-sast
+    needs: [scan]
+    if: always() && github.event.action != 'closed'
+    runs-on: [self-hosted, sonar-gate]
+    timeout-minutes: 65
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout feature HEAD
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Fail closed if scan did not succeed
+        if: needs.scan.result != 'success'
+        shell: bash
+        run: |
+          echo '::error::Scanner job failed, cancelled, or skipped. PR cannot merge.'
+          exit 1
+
+      - name: Download submitted CE task
+        if: needs.scan.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: ce-task-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .sonar-task
+
+      - name: Compute PR merge-base
+        if: needs.scan.result == 'success'
+        id: mb
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        shell: bash
         run: |
           set -euo pipefail
-          LIB="${RUNNER_TOOL_CACHE}/pr-sast-gate/${JACKSON_VERSION}"
+          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+          MB=$(git merge-base "origin/${BASE_REF}" HEAD)
+          echo "merge_base=${MB}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare gate dependencies
+        if: needs.scan.result == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LIB="${RUNNER_TEMP}/pr-sast-gate/${JACKSON_VERSION}"
           mkdir -p "$LIB"
           for a in jackson-databind jackson-core jackson-annotations; do
             f="$LIB/$a-${JACKSON_VERSION}.jar"
             [ -s "$f" ] || curl -fsSL -o "$f" \
-              "https://repo1.maven.org/maven2/com/fasterxml/jackson/core/$a/${JACKSON_VERSION}/$a-${JACKSON_VERSION}.jar"
+              "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/$a/${JACKSON_VERSION}/$a-${JACKSON_VERSION}.jar"
           done
           echo "GATE_LIB=$LIB" >> "$GITHUB_ENV"
 
-      - name: Security gate
+      - name: Diff Security Gate (no SonarQube Quality Gate enforcement)
+        if: needs.scan.result == 'success'
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           MERGE_BASE: ${{ steps.mb.outputs.merge_base }}
           BLOCK_SEVERITIES: ${{ vars.BLOCK_SEVERITIES || 'BLOCKER,HIGH' }}
-          REPORT_TASK_FILE: build/sonar/report-task.txt
-          CE_TIMEOUT_MINUTES: "10"
+          REPORT_TASK_FILE: .sonar-task/report-task.txt
+          CE_TIMEOUT_MINUTES: '45'
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
         run: java -cp "${GATE_LIB}/*" .sonar-pr/PrSastGate.java
 
-      # Gate가 이슈를 발견해 exit 1이어도 결과 파일이 있으면 인라인 리뷰 게시
       - name: Publish inline SAST review comments
-        if: always() && !cancelled() && github.event.action != 'closed'
+        if: always() && needs.scan.result == 'success' && !cancelled()
         uses: actions/github-script@v7
         with:
           script: |
             await require('./.sonar-pr/review-publisher.js')({ github, context, core });
 
-      # 성공/실패와 관계없이 PR에 요약 코멘트 1개를 생성 또는 갱신
       - name: PR summary comment
-        if: always()
+        if: always() && !cancelled()
         uses: actions/github-script@v7
         with:
           script: |
@@ -120,28 +177,30 @@ jobs:
             const marker = '<!-- sonar-pr-sast -->';
             let body = fs.existsSync('sast-result.md')
               ? fs.readFileSync('sast-result.md', 'utf8')
-              : '## ❌ SAST 스캔 실패\n\n빌드 또는 분석 단계에서 실패했습니다. **병합할 수 없습니다.** Actions 로그를 확인하세요.';
+              : '## ❌ SAST 실행 실패\n\nScanner 또는 Gate 단계가 실패해 검사가 완료되지 않았습니다.';
             body = `${marker}\n${body}\n\n_run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}_`;
             const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
-            const mine = comments.find(c => c.body && c.body.startsWith(marker));
+            const mine = comments.find(c => c.body && c.body.startsWith(marker) && c.user?.login === 'github-actions[bot]');
             if (mine) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+              await github.rest.issues.updateComment({owner, repo, comment_id: mine.id, body});
             } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              await github.rest.issues.createComment({owner, repo, issue_number, body});
             }
 
   cleanup:
     name: sonar-pr-cleanup
     if: github.event.action == 'closed'
-    runs-on: [self-hosted, sonar-poc]
+    runs-on: [self-hosted, sonar-scan]
+    timeout-minutes: 10
     steps:
-      - name: Delete SonarQube PR project
+      - name: Delete closed PR project
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        shell: bash
         run: |
-          curl -fsS -H "Authorization: Bearer ${SONAR_TOKEN}" -X POST "${SONAR_HOST_URL}/api/projects/delete" \
-            --data-urlencode "project=${SONAR_PROJECT_KEY}" \
-            && echo "deleted ${SONAR_PROJECT_KEY}" \
-            || echo "::warning::프로젝트 삭제 실패(이미 없거나 서버 오류): ${SONAR_PROJECT_KEY}"
+          set -euo pipefail
+          curl -fsS -X POST -H "Authorization: Bearer ${SONAR_TOKEN}" \
+            "${SONAR_HOST_URL}/api/projects/delete" \
+            --data-urlencode "project=${SONAR_PROJECT_KEY}"
