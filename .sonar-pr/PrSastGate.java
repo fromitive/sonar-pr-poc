@@ -90,9 +90,11 @@ public class PrSastGate {
         // 삭제만 있는 변경도 "변경 파일" 경고 범위에 포함한다.
         Set<String> changedFiles = changedFiles(mergeBase);
         List<Finding> allIssues = fetchSecurityIssues();
-        List<Finding> diffIssues = inDiff(allIssues, changed);
+        List<Finding> scaIssues = allIssues.stream().filter(PrSastGate::isSca).toList();
+        List<Finding> sastIssues = allIssues.stream().filter(f -> !isSca(f)).toList();
+        List<Finding> diffIssues = inDiff(sastIssues, changed);
         Set<String> diffKeys = diffIssues.stream().map(Finding::key).collect(Collectors.toSet());
-        List<Finding> fileWarnings = allIssues.stream()
+        List<Finding> fileWarnings = sastIssues.stream()
                 .filter(f -> changedFiles.contains(f.path()) && !diffKeys.contains(f.key()))
                 .toList();
         List<Finding> hotspots = inDiff(fetchHotspots(), changed);
@@ -101,27 +103,91 @@ public class PrSastGate {
         List<Finding> lineWarnings = diffIssues.stream()
                 .filter(f -> !blockSeverities.contains(f.severity())).toList();
 
-        // 4) 출력: 차단은 변경 라인만, 변경 파일의 나머지는 경고만
+        List<Finding> scaBlocking = scaIssues.stream()
+                .filter(f -> blockSeverities.contains(f.severity()) || "UNKNOWN".equals(f.severity())).toList();
+        List<Finding> scaWarnings = scaIssues.stream().filter(f -> !scaBlocking.contains(f)).toList();
+        List<Finding> inlineScaBlocking = mapScaToDiff(scaBlocking, changed);
+        List<Finding> inlineScaWarnings = mapScaToDiff(scaWarnings, changed);
+
+        // 4) SAST는 변경 라인, SCA는 전체 미승인 이슈를 판정한다.
         annotate(blocking, "error");
         annotate(lineWarnings, "warning");
+        annotate(inlineScaBlocking, "error");
+        annotate(inlineScaWarnings, "warning");
         // Diff 외부 라인은 GitHub PR annotation이 표시되지 않을 수 있어 요약 리포트에만 기록
         annotate(hotspots, "notice");
-        writeReport(buildReport(blocking, lineWarnings, fileWarnings, hotspots, blockSeverities, mergeBase));
+        String report = buildReport(blocking, lineWarnings, fileWarnings, hotspots, blockSeverities, mergeBase);
+        StringBuilder scaReport = new StringBuilder("\n## Trivy SCA — 전체 미승인 의존성 검사\n\n");
+        scaReport.append("차단: ").append(scaBlocking.size()).append(" / 경고: ").append(scaWarnings.size())
+                .append(" / 인라인 매핑: ").append(inlineScaBlocking.size() + inlineScaWarnings.size()).append("\n\n");
+        section(scaReport, "SCA 차단 이슈", scaBlocking, false);
+        section(scaReport, "SCA 경고", scaWarnings, false);
+        if (!scaBlocking.isEmpty()) scaReport.append("SonarQube에서 오탐 또는 위험 수용을 승인한 후 재검사하세요.\n");
+        writeReport((!scaBlocking.isEmpty() && blocking.isEmpty() ? "## ❌ 통합 보안 게이트 차단 (SCA)\n\n" : "") + report + scaReport);
         // GitHub Review Publisher가 사용하는 구조화된 결과.
         // 출력 실패 시 잘못된 PR 리뷰를 게시하지 않도록 Gate 실패 처리.
         Map<String, Object> reviewPayload = new LinkedHashMap<>();
         reviewPayload.put("projectKey", projectKey);
         reviewPayload.put("mergeBase", mergeBase);
         reviewPayload.put("headSha", env("HEAD_SHA", null));
-        reviewPayload.put("blocking", blocking);
-        reviewPayload.put("lineWarnings", lineWarnings);
+        reviewPayload.put("blocking", concat(blocking, inlineScaBlocking));
+        reviewPayload.put("lineWarnings", concat(lineWarnings, inlineScaWarnings));
+        reviewPayload.put("scaBlocking", scaBlocking);
+        reviewPayload.put("scaWarnings", scaWarnings);
         reviewPayload.put("fileWarnings", fileWarnings);
         reviewPayload.put("hotspots", hotspots);
         JSON.writerWithDefaultPrettyPrinter().writeValue(Path.of("sast-findings.json").toFile(), reviewPayload);
 
-        System.out.printf("차단 %d / 변경 라인 경고 %d / 변경 파일 경고 %d / Hotspot %d%n",
-                blocking.size(), lineWarnings.size(), fileWarnings.size(), hotspots.size());
-        return blocking.isEmpty() ? 0 : 1;
+        System.out.printf("SAST 차단 %d / SCA 차단 %d / SCA 경고 %d / 변경 라인 경고 %d / 변경 파일 경고 %d / Hotspot %d%n",
+                blocking.size(), scaBlocking.size(), scaWarnings.size(), lineWarnings.size(), fileWarnings.size(), hotspots.size());
+        return blocking.isEmpty() && scaBlocking.isEmpty() ? 0 : 1;
+    }
+
+    // Trivy Generic External Issues engineId = trivy-gradle.
+    static boolean isSca(Finding f) {
+        return f.rule().startsWith("external_trivy-gradle:")
+                || (f.path().equals("gradle.lockfile") && f.message().contains(" | Trivy "));
+    }
+
+    static List<Finding> concat(List<Finding> a, List<Finding> b) {
+        List<Finding> result = new ArrayList<>(a);
+        result.addAll(b);
+        return result;
+    }
+
+    // Only map exact, literal G:A:V declarations on added/modified lines.
+    // Keep the original Sonar issue key and rule; never change the stored issue location.
+    static List<Finding> mapScaToDiff(List<Finding> findings, Map<String, BitSet> changed) throws Exception {
+        List<Finding> result = new ArrayList<>();
+        for (Finding f : findings) {
+            String[] fields = f.message().split("\\s*\\|\\s*", -1);
+            if (fields.length < 2 || fields[1].split(":", -1).length != 3) continue;
+            String coord = fields[1];
+            Pattern declaration = Pattern.compile("^\\s*(?:implementation|api|compileOnly|runtimeOnly|testImplementation|testRuntimeOnly|annotationProcessor)\\s*\\(?\\s*(['\"])(" + Pattern.quote(coord) + ")\\1\\s*\\)?\\s*;?\\s*(?://.*)?$");
+            List<Finding> candidates = new ArrayList<>();
+            for (var entry : changed.entrySet()) {
+                String path = entry.getKey();
+                // Current PoC scans the root gradle.lockfile only.
+                if (!path.equals("build.gradle") && !path.equals("build.gradle.kts")) continue;
+                Process proc = new ProcessBuilder("git", "show", "HEAD:" + path).start();
+                String content = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                if (proc.waitFor() != 0) throw new IllegalStateException("Cannot read HEAD:" + path);
+                String[] source = content.split("\\R", -1);
+                boolean blockComment = false;
+                for (int i = 0; i < source.length; i++) {
+                    String line = source[i];
+                    // Conservative: do not map lines in or containing block comments.
+                    if (blockComment || line.contains("/*")) {
+                        blockComment = !line.contains("*/");
+                        continue;
+                    }
+                    if (!entry.getValue().get(i + 1) || !declaration.matcher(line).matches()) continue;
+                    candidates.add(new Finding(f.kind(), f.key(), f.rule(), path, i + 1, i + 1, f.message(), f.severity()));
+                }
+            }
+            if (candidates.size() == 1) result.add(candidates.get(0));
+        }
+        return result;
     }
 
     // ---------------------------------------------------------------- SonarQube
@@ -307,7 +373,7 @@ public class PrSastGate {
                               Set<String> blockSeverities, String mergeBase) {
         StringBuilder sb = new StringBuilder();
         sb.append(blocking.isEmpty()
-                ? "## ✅ SAST 통과 — PR 변경 코드에 차단 대상 보안 이슈가 없습니다\n\n"
+                ? "## SAST — PR 변경 코드에 차단 대상 보안 이슈가 없습니다\n\n"
                 : "## ❌ SAST 차단 — PR 변경 코드에 보안 이슈 " + blocking.size() + "건\n\n");
         sb.append("| 구분 | 건수 |\n|---|---|\n")
           .append("| 차단 (").append(String.join("/", new TreeSet<>(blockSeverities))).append(") | ")
@@ -345,7 +411,7 @@ public class PrSastGate {
             String repo = env("GITHUB_REPOSITORY", "");
             String sha = env("HEAD_SHA", "");
             String server = env("GITHUB_SERVER_URL", "https://github.com");
-            String sourceLink = repo.isEmpty() || sha.isEmpty() ? link
+            String sourceLink = isSca(f) || repo.isEmpty() || sha.isEmpty() ? link
                     : server + "/" + repo + "/blob/" + sha + "/" +
                       f.path().replace(" ", "%20") + (f.startLine() > 0 ? "#L" + f.startLine() : "");
             sb.append("| ").append(f.severity())
