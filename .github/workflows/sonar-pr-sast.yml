@@ -68,7 +68,40 @@ jobs:
           # Use the add_project/select APIs from the separate Quality Profile guide.
 
       - name: Gradle build
-        run: ./gradlew --no-daemon clean build --build-cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "[INFO] Java environment"
+          echo "JAVA_HOME=$JAVA_HOME"
+          which java
+          java -version
+
+          echo "[INFO] Stop Gradle daemon"
+          ./gradlew --stop
+
+          echo "[INFO] Isolate Gradle caches"
+          export GRADLE_USER_HOME="$(mktemp -d "${RUNNER_TEMP}/gradle.XXXXXX")"
+
+          rm -rf .gradle build
+
+          echo "[INFO] Check Gradle version"
+          ./gradlew --version
+
+          echo "[INFO] Validate Gradle configuration"
+          ./gradlew \
+            -Dorg.gradle.java.home="$JAVA_HOME" \
+            --no-daemon \
+            --no-configuration-cache \
+            help --stacktrace
+
+          echo "[INFO] Gradle build"
+          ./gradlew \
+            -Dorg.gradle.java.home="$JAVA_HOME" \
+            --no-daemon \
+            --no-build-cache \
+            --no-configuration-cache \
+            clean build --stacktrace --info
 
       - name: Generate Gradle dependency lockfile
         shell: bash
