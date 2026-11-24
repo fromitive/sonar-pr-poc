@@ -55,7 +55,29 @@ jobs:
           # Use the add_project/select APIs from the separate Quality Profile guide.
 
       - name: Gradle build
-        run: ./gradlew --no-daemon clean build --build-cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s gradle.lockfile
+          git ls-files --error-unmatch gradle.lockfile
+
+          ./gradlew --no-daemon clean build --build-cache
+
+          git diff --exit-code HEAD -- gradle.lockfile
+
+      - name: Trivy Gradle dependency scan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          trivy --version
+          python3 --version
+
+          bash .sonar-pr/trivy-scan.sh
+
+          test -s .trivy-poc/trivy.json
+          test -s .trivy-poc/sonar.json
 
       - name: Limit SonarQube CE backlog before submission
         env:
@@ -74,12 +96,16 @@ jobs:
         run: |
           set -euo pipefail
           rm -f build/sonar/report-task.txt
+
           ./gradlew --no-daemon sonar \
             -Dsonar.host.url="${SONAR_HOST_URL}" \
             -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
             -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
             -Dsonar.projectVersion="${HEAD_SHA}" \
+            -Dsonar.sources=src/main,gradle.lockfile \
+            -Dsonar.externalIssuesReportPaths=.trivy-poc/sonar.json \
             -Dsonar.qualitygate.wait=false
+
           test -s build/sonar/report-task.txt
           grep -q '^ceTaskId=' build/sonar/report-task.txt
 
