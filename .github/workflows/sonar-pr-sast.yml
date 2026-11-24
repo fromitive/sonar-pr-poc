@@ -12,6 +12,7 @@ concurrency:
 env:
   SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
   SONAR_PROJECT_KEY: pr-${{ github.event.repository.name }}-${{ github.event.pull_request.number }}
+  SONAR_PROJECT_NAME: sonar-pr-poc [PR #${{ github.event.pull_request.number }}]
   JACKSON_VERSION: 2.17.2
 
 jobs:
@@ -67,14 +68,15 @@ jobs:
 
       - name: Build & SonarQube analysis
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}   # Scanner가 환경변수로 읽음 (명령행에 노출하지 않음)
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+            SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+            HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           rm -f build/sonar/report-task.txt
           ./gradlew --no-daemon clean build sonar \
             -Dsonar.host.url="${SONAR_HOST_URL}" \
             -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+            -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
             -Dsonar.projectVersion="${HEAD_SHA}" \
             -Dsonar.qualitygate.wait=false
 
