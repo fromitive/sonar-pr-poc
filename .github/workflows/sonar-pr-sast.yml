@@ -99,7 +99,16 @@ jobs:
           BLOCK_SEVERITIES: ${{ vars.BLOCK_SEVERITIES || 'BLOCKER,HIGH' }}
           REPORT_TASK_FILE: build/sonar/report-task.txt
           CE_TIMEOUT_MINUTES: "10"
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: java -cp "${GATE_LIB}/*" .sonar-pr/PrSastGate.java
+
+      # Gate가 이슈를 발견해 exit 1이어도 결과 파일이 있으면 인라인 리뷰 게시
+      - name: Publish inline SAST review comments
+        if: always() && !cancelled() && github.event.action != 'closed'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await require('./.sonar-pr/review-publisher.js')({ github, context, core });
 
       # 성공/실패와 관계없이 PR에 요약 코멘트 1개를 생성 또는 갱신
       - name: PR summary comment

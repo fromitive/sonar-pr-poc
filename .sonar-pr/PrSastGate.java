@@ -107,6 +107,17 @@ public class PrSastGate {
         // Diff 외부 라인은 GitHub PR annotation이 표시되지 않을 수 있어 요약 리포트에만 기록
         annotate(hotspots, "notice");
         writeReport(buildReport(blocking, lineWarnings, fileWarnings, hotspots, blockSeverities, mergeBase));
+        // GitHub Review Publisher가 사용하는 구조화된 결과.
+        // 출력 실패 시 잘못된 PR 리뷰를 게시하지 않도록 Gate 실패 처리.
+        Map<String, Object> reviewPayload = new LinkedHashMap<>();
+        reviewPayload.put("projectKey", projectKey);
+        reviewPayload.put("mergeBase", mergeBase);
+        reviewPayload.put("headSha", env("HEAD_SHA", null));
+        reviewPayload.put("blocking", blocking);
+        reviewPayload.put("lineWarnings", lineWarnings);
+        reviewPayload.put("fileWarnings", fileWarnings);
+        reviewPayload.put("hotspots", hotspots);
+        JSON.writerWithDefaultPrettyPrinter().writeValue(Path.of("sast-findings.json").toFile(), reviewPayload);
 
         System.out.printf("차단 %d / 변경 라인 경고 %d / 변경 파일 경고 %d / Hotspot %d%n",
                 blocking.size(), lineWarnings.size(), fileWarnings.size(), hotspots.size());
@@ -331,9 +342,15 @@ public class PrSastGate {
             String link = "HOTSPOT".equals(f.kind())
                     ? host + "/security_hotspots?id=" + enc(projectKey) + "&hotspots=" + enc(f.key())
                     : host + "/project/issues?id=" + enc(projectKey) + "&open=" + enc(f.key());
+            String repo = env("GITHUB_REPOSITORY", "");
+            String sha = env("HEAD_SHA", "");
+            String server = env("GITHUB_SERVER_URL", "https://github.com");
+            String sourceLink = repo.isEmpty() || sha.isEmpty() ? link
+                    : server + "/" + repo + "/blob/" + sha + "/" +
+                      f.path().replace(" ", "%20") + (f.startLine() > 0 ? "#L" + f.startLine() : "");
             sb.append("| ").append(f.severity())
               .append(" | `").append(f.rule()).append("` ").append(cell(rule(f.rule()).name()))
-              .append(" | [").append(cell(f.path())).append(":").append(f.startLine()).append("](").append(link).append(")")
+              .append(" | [").append(cell(f.path())).append(":").append(f.startLine()).append("](").append(sourceLink).append(")")
               .append(" | ").append(cell(f.message())).append(" |\n");
         }
         sb.append("\n");
